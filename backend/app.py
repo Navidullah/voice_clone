@@ -157,11 +157,24 @@ def require_api_key(request: Request) -> None:
 
 app = FastAPI(title="Voice Clone")
 
-# Allow your website's frontend to call this API from the browser.
-# Tighten allow_origins to your domain(s) before going public.
+# Which website origins may call this API *directly from a browser*.
+# Read from ALLOWED_ORIGINS (comma-separated) so you don't edit code per-env.
+# Defaults cover local dev + shopyor.com. Use "*" to allow any origin (dev only).
+#
+# Note: when you call this API through a SERVER-SIDE proxy (the recommended
+# pattern, e.g. nextjs-proxy-example/), CORS does not apply — the request comes
+# from your website's server, not the browser. CORS only gates direct browser
+# calls, so this mainly hardens against other sites embedding your API.
+_default_origins = (
+    "http://localhost:8000,http://127.0.0.1:8000,"
+    "https://shopyor.com,https://www.shopyor.com"
+)
+ALLOWED_ORIGINS = [
+    o.strip() for o in os.getenv("ALLOWED_ORIGINS", _default_origins).split(",") if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
