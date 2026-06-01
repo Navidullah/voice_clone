@@ -1,0 +1,7 @@
+venv/
+voices/*.wav
+outputs/*.wav
+__pycache__/
+*.pyc
+.env
+backend/.env

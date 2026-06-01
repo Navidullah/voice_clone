@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Voice Clone</title>
+<style>
+  :root { --bg:#0f1116; --card:#1a1d27; --accent:#6c8cff; --text:#e6e8ef; --muted:#8a90a3; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:system-ui,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text); }
+  .wrap { max-width:640px; margin:40px auto; padding:0 20px; }
+  h1 { font-weight:650; }
+  .card { background:var(--card); border-radius:14px; padding:22px; margin-bottom:18px; }
+  label { display:block; font-size:13px; color:var(--muted); margin-bottom:8px; }
+  input[type=file], textarea, button { font:inherit; }
+  textarea { width:100%; min-height:90px; resize:vertical; background:#11131a; border:1px solid #2a2e3c;
+             color:var(--text); border-radius:8px; padding:10px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:11px 18px;
+           cursor:pointer; font-weight:600; }
+  button:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .status { font-size:13px; color:var(--muted); margin-top:10px; min-height:18px; }
+  .ok { color:#5fd08a; } .err { color:#ff7676; }
+  audio { width:100%; margin-top:14px; }
+  .step { font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--accent); margin-bottom:6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🎙️ Voice Clone</h1>
+  <p style="color:var(--muted)">Upload a 10–30s clean voice sample, then type text to speak in that voice.
+     <strong>Only clone voices you have permission to use.</strong></p>
+
+  <div id="authCard" class="card" hidden>
+    <div class="step">API key</div>
+    <label>This server requires an API key. It is stored only in your browser.</label>
+    <div class="row">
+      <input id="apiKey" type="password" placeholder="vc_…" style="flex:1; min-width:220px; background:#11131a;
+             border:1px solid #2a2e3c; color:var(--text); border-radius:8px; padding:10px" />
+      <button id="saveKey">Save</button>
+    </div>
+    <div id="authStatus" class="status"></div>
+  </div>
+
+  <div class="card">
+    <div class="step">Step 1 — Voice sample</div>
+    <label>A single clear speaker, 10–30 seconds. Record below, or upload a file.</label>
+
+    <div class="row">
+      <button id="recBtn">● Record</button>
+      <button id="stopBtn" disabled>■ Stop</button>
+      <span id="recTimer" style="font-variant-numeric:tabular-nums; color:var(--muted)">00:00</span>
+    </div>
+    <audio id="recPreview" controls hidden></audio>
+
+    <div style="text-align:center; color:var(--muted); font-size:12px; margin:16px 0 12px">— or —</div>
+
+    <label>Upload WAV / MP3 / FLAC</label>
+    <div class="row">
+      <input id="file" type="file" accept="audio/*" />
+    </div>
+    <label style="display:flex; gap:8px; align-items:flex-start; margin-top:14px; color:var(--text); cursor:pointer">
+      <input id="consent" type="checkbox" style="margin-top:3px" />
+      <span style="font-size:13px">I confirm this is my own voice, or I have explicit permission from the
+        speaker to clone it.</span>
+    </label>
+    <div class="row" style="margin-top:12px">
+      <button id="cloneBtn">Upload</button>
+    </div>
+    <div id="cloneStatus" class="status"></div>
+  </div>
+
+  <div class="card">
+    <div class="step">Step 2 — Generate</div>
+    <label>Text to speak</label>
+    <textarea id="text" placeholder="Type what you want the voice to say...">Hello! This is my cloned voice.</textarea>
+    <div class="row" style="margin-top:12px">
+      <button id="genBtn" disabled>Generate speech</button>
+    </div>
+    <div id="genStatus" class="status"></div>
+    <audio id="player" controls hidden></audio>
+  </div>
+</div>
+
+<script>
+const API = ""; // same origin; set to "http://localhost:8000" if hosting frontend elsewhere
+let voiceId = null;
+
+const $ = id => document.getElementById(id);
+function setStatus(el, msg, cls=""){ el.className = "status " + cls; el.textContent = msg; }
+
+// --- API key handling ---
+function getKey(){ return localStorage.getItem("vc_api_key") || ""; }
+function authHeaders(){ const k = getKey(); return k ? { "X-API-Key": k } : {}; }
+
+$("apiKey").value = getKey();
+$("saveKey").onclick = () => {
+  localStorage.setItem("vc_api_key", $("apiKey").value.trim());
+  setStatus($("authStatus"), "Saved.", "ok");
+};
+
+// On load, ask the server whether auth is required and reveal the key field if so.
+fetch(API + "/health").then(r => r.json()).then(h => {
+  if (h.auth_required) $("authCard").hidden = false;
+}).catch(()=>{});
+
+// --- In-browser recorder ---------------------------------------------------
+// MediaRecorder gives us WebM/Opus; we decode it and re-encode to a clean
+// 16-bit mono WAV so the backend can read it reliably.
+let mediaRecorder = null, chunks = [], recordedWav = null, timerId = null, recStart = 0;
+
+function fmtTime(ms){ const s = Math.floor(ms/1000); return String(Math.floor(s/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0"); }
+
+$("recBtn").onclick = async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: {
+      echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    chunks = [];
+    mediaRecorder = new MediaRecorder(stream);
+    mediaRecorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+    mediaRecorder.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      clearInterval(timerId);
+      setStatus($("cloneStatus"), "Processing recording…");
+      try {
+        const webm = new Blob(chunks, { type: chunks[0]?.type || "audio/webm" });
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const audioBuf = await ctx.decodeAudioData(await webm.arrayBuffer());
+        recordedWav = encodeWAV(audioBuf);
+        $("recPreview").src = URL.createObjectURL(recordedWav);
+        $("recPreview").hidden = false;
+        const dur = audioBuf.duration.toFixed(1);
+        const hint = audioBuf.duration < 8 ? " (a bit short — aim for 10–30s)" : "";
+        setStatus($("cloneStatus"), `Recorded ${dur}s${hint}. Tick consent and click Upload.`, "ok");
+      } catch (err) { setStatus($("cloneStatus"), "Could not process recording: " + err.message, "err"); }
+    };
+    mediaRecorder.start();
+    recStart = Date.now();
+    $("recTimer").textContent = "00:00";
+    timerId = setInterval(() => { $("recTimer").textContent = fmtTime(Date.now() - recStart); }, 200);
+    $("recBtn").disabled = true; $("stopBtn").disabled = false;
+    setStatus($("cloneStatus"), "Recording… speak naturally.");
+  } catch (err) {
+    setStatus($("cloneStatus"), "Microphone access denied or unavailable: " + err.message, "err");
+  }
+};
+
+$("stopBtn").onclick = () => {
+  if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
+  $("recBtn").disabled = false; $("stopBtn").disabled = true;
+};
+
+// Recording a new sample supersedes any chosen file (and vice versa).
+$("file").onchange = () => { if ($("file").files[0]) { recordedWav = null; $("recPreview").hidden = true; } };
+
+function encodeWAV(audioBuffer){
+  const sr = audioBuffer.sampleRate, n = audioBuffer.length;
+  const ch0 = audioBuffer.getChannelData(0);
+  let samples = ch0;
+  if (audioBuffer.numberOfChannels > 1){            // downmix to mono
+    const ch1 = audioBuffer.getChannelData(1);
+    samples = new Float32Array(n);
+    for (let i=0;i<n;i++) samples[i] = (ch0[i] + ch1[i]) / 2;
+  }
+  const buf = new ArrayBuffer(44 + n*2), v = new DataView(buf);
+  const ws = (o,s) => { for (let i=0;i<s.length;i++) v.setUint8(o+i, s.charCodeAt(i)); };
+  ws(0,"RIFF"); v.setUint32(4, 36 + n*2, true); ws(8,"WAVE"); ws(12,"fmt ");
+  v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
+  v.setUint32(24,sr,true); v.setUint32(28,sr*2,true); v.setUint16(32,2,true); v.setUint16(34,16,true);
+  ws(36,"data"); v.setUint32(40, n*2, true);
+  let o = 44;
+  for (let i=0;i<n;i++,o+=2){ const x = Math.max(-1, Math.min(1, samples[i])); v.setInt16(o, x<0 ? x*0x8000 : x*0x7FFF, true); }
+  return new Blob([buf], { type: "audio/wav" });
+}
+
+$("cloneBtn").onclick = async () => {
+  const f = recordedWav || $("file").files[0];
+  if (!f) return setStatus($("cloneStatus"), "Record a sample or pick an audio file first.", "err");
+  if (!$("consent").checked) return setStatus($("cloneStatus"), "Please confirm you have permission to clone this voice.", "err");
+  setStatus($("cloneStatus"), "Uploading…");
+  const fd = new FormData();
+  fd.append("sample", f, recordedWav ? "recording.wav" : f.name);
+  fd.append("consent", "true");
+  try {
+    const r = await fetch(API + "/api/clone", { method:"POST", body:fd, headers: authHeaders() });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.detail || "upload failed");
+    voiceId = j.voice_id;
+    $("genBtn").disabled = false;
+    let msg = `Voice ready (${j.duration_sec}s sample). You can generate now.`;
+    if (j.warnings && j.warnings.length) msg += " ⚠️ " + j.warnings.join(" ");
+    setStatus($("cloneStatus"), msg, "ok");
+  } catch (e) { setStatus($("cloneStatus"), e.message, "err"); }
+};
+
+$("genBtn").onclick = async () => {
+  const text = $("text").value.trim();
+  if (!text) return setStatus($("genStatus"), "Enter some text.", "err");
+  if (!voiceId) return setStatus($("genStatus"), "Upload a voice sample first.", "err");
+  setStatus($("genStatus"), "Generating… (first run loads the model, give it a moment)");
+  $("genBtn").disabled = true;
+  const fd = new FormData();
+  fd.append("voice_id", voiceId);
+  fd.append("text", text);
+  try {
+    const r = await fetch(API + "/api/generate", { method:"POST", body:fd, headers: authHeaders() });
+    if (!r.ok) { const j = await r.json().catch(()=>({})); throw new Error(j.detail || "generation failed"); }
+    const blob = await r.blob();
+    $("player").src = URL.createObjectURL(blob);
+    $("player").hidden = false;
+    $("player").play();
+    setStatus($("genStatus"), "Done.", "ok");
+  } catch (e) { setStatus($("genStatus"), e.message, "err"); }
+  finally { $("genBtn").disabled = false; }
+};
+</script>
+</body>
+</html>

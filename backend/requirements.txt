@@ -1,0 +1,5 @@
+# Install torch/torchaudio from the CUDA index (see README), then the rest:
+chatterbox-tts
+fastapi
+uvicorn[standard]
+python-multipart
