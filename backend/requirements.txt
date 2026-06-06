@@ -9,3 +9,5 @@ librosa
 soundfile
 pydub
 numpy
+# pyworld = WORLD vocoder, used for formant-preserving (natural) pitch shifting.
+pyworld

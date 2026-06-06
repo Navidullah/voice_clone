@@ -386,6 +386,30 @@ def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
+def _pitch_shift(audio: "np.ndarray", sr: int, semitones: float) -> "np.ndarray":
+    """Formant-preserving pitch shift via the WORLD vocoder.
+
+    WORLD keeps the spectral envelope (formants) fixed and only moves F0, so a
+    shifted voice sounds like the same speaker at a lower/higher pitch instead
+    of the metallic, transient-smeared result of a phase vocoder — much better
+    for speech. Falls back to librosa if WORLD fails for any reason.
+    """
+    try:
+        import pyworld as pw
+        x = np.ascontiguousarray(audio, dtype=np.float64)
+        f0, t = pw.harvest(x, sr)          # robust F0 contour
+        sp = pw.cheaptrick(x, f0, t, sr)   # spectral envelope (formants) — kept fixed
+        ap = pw.d4c(x, f0, t, sr)          # aperiodicity
+        f0_shifted = f0 * (2.0 ** (semitones / 12.0))
+        y = pw.synthesize(f0_shifted, sp, ap, sr)
+        return np.ascontiguousarray(y, dtype=np.float32)
+    except Exception:
+        import librosa
+        return librosa.effects.pitch_shift(
+            np.ascontiguousarray(audio, dtype=np.float32), sr=sr, n_steps=float(semitones)
+        )
+
+
 def _postprocess(wav: "torch.Tensor", sr: int, pitch: float, speed: float) -> "np.ndarray":
     """Downmix to mono float32 and apply pitch-shift / time-stretch (CPU).
 
@@ -398,17 +422,23 @@ def _postprocess(wav: "torch.Tensor", sr: int, pitch: float, speed: float) -> "n
         audio = audio.mean(axis=0)  # downmix to mono
     audio = np.ascontiguousarray(audio, dtype=np.float32)
 
-    if abs(pitch) > 1e-6 or abs(speed - 1.0) > 1e-6:
-        import librosa  # heavy import — only loaded when actually needed
-        if abs(pitch) > 1e-6:
-            audio = librosa.effects.pitch_shift(audio, sr=sr, n_steps=float(pitch))
-        if abs(speed - 1.0) > 1e-6:
-            audio = librosa.effects.time_stretch(audio, rate=float(speed))
+    if abs(pitch) > 1e-6:
+        audio = _pitch_shift(audio, sr, pitch)
+    if abs(speed - 1.0) > 1e-6:
+        import librosa  # phase-vocoder time-stretch is fine for tempo
+        audio = librosa.effects.time_stretch(
+            np.ascontiguousarray(audio, dtype=np.float32), rate=float(speed)
+        )
     return np.ascontiguousarray(audio, dtype=np.float32)
 
 
 def _encode(audio: "np.ndarray", sr: int, fmt: str) -> tuple[io.BytesIO, str, str]:
     """Encode a mono float32 signal to wav or mp3. Returns (buffer, media_type, ext)."""
+    # Guard against clipping noise: scale down (never up) if a post-processing
+    # step pushed the peak above full scale.
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if peak > 0.999:
+        audio = audio * (0.99 / peak)
     pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
     if fmt == "mp3":
         from pydub import AudioSegment  # needs ffmpeg on PATH
