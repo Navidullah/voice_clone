@@ -13,6 +13,7 @@ The model is loaded ONCE at startup and kept resident on the GPU.
 
 import io
 import os
+import json
 import uuid
 import time
 import hmac
@@ -21,6 +22,7 @@ import threading
 from collections import defaultdict, deque
 from pathlib import Path
 
+import numpy as np
 import torch
 import torchaudio
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Depends
@@ -42,8 +44,40 @@ ROOT = Path(__file__).resolve().parent.parent
 VOICES_DIR = ROOT / "voices"      # stored reference samples, named <voice_id>.wav
 OUTPUTS_DIR = ROOT / "outputs"    # generated clips (cache / debugging)
 FRONTEND = ROOT / "frontend" / "index.html"
+META_PATH = VOICES_DIR / "voices.json"  # voice_id -> {name, created_at, duration_sec}
 VOICES_DIR.mkdir(exist_ok=True)
 OUTPUTS_DIR.mkdir(exist_ok=True)
+
+# Guards concurrent read-modify-write of the voices.json metadata sidecar.
+_meta_lock = threading.Lock()
+
+
+def _read_meta() -> dict:
+    if META_PATH.exists():
+        try:
+            return json.loads(META_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _set_meta_entry(voice_id: str, entry: dict) -> None:
+    with _meta_lock:
+        meta = _read_meta()
+        meta[voice_id] = entry
+        META_PATH.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def _delete_meta_entry(voice_id: str) -> None:
+    with _meta_lock:
+        meta = _read_meta()
+        if meta.pop(voice_id, None) is not None:
+            META_PATH.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def _clean_name(name: str) -> str:
+    name = (name or "").strip()
+    return name[:60] if name else "My voice"
 
 # Safety cap so a single request can't lock the GPU forever.
 MAX_CHARS = 1000
@@ -217,7 +251,48 @@ def index():
 
 @app.get("/api/voices", dependencies=[Depends(require_api_key)])
 def list_voices():
-    return {"voices": [p.stem for p in VOICES_DIR.glob("*.wav")]}
+    """List every voice stored on this server, newest first, with metadata.
+
+    Note: this returns ALL voices on the machine, so it's meant for local/admin
+    use. The public website builds its per-visitor library from the browser's
+    own localStorage instead (a shared server list would leak voices between
+    visitors).
+    """
+    with _meta_lock:
+        meta = _read_meta()
+    voices = []
+    for p in VOICES_DIR.glob("*.wav"):
+        m = meta.get(p.stem, {})
+        voices.append({
+            "voice_id": p.stem,
+            "name": m.get("name", "Untitled voice"),
+            "created_at": m.get("created_at"),
+            "duration_sec": m.get("duration_sec"),
+        })
+    voices.sort(key=lambda v: v["created_at"] or 0, reverse=True)
+    return {"voices": voices}
+
+
+@app.delete("/api/voices/{voice_id}", dependencies=[Depends(require_api_key)])
+def delete_voice(voice_id: str):
+    """Delete a stored sample and its metadata."""
+    path = _voice_path(voice_id)  # validates voice_id (path-traversal guard)
+    existed = path.exists()
+    if existed:
+        path.unlink()
+    _delete_meta_entry(voice_id)
+    if not existed:
+        raise HTTPException(404, "unknown voice_id")
+    return {"deleted": True}
+
+
+@app.get("/api/voices/{voice_id}/sample", dependencies=[Depends(require_api_key)])
+def voice_sample(voice_id: str):
+    """Stream a stored reference sample back (used for library preview)."""
+    path = _voice_path(voice_id)
+    if not path.exists():
+        raise HTTPException(404, "unknown voice_id")
+    return FileResponse(str(path), media_type="audio/wav")
 
 
 def analyze_audio(wav: "torch.Tensor", sr: int) -> tuple[float, list[str]]:
@@ -262,6 +337,7 @@ async def clone(
     request: Request,
     sample: UploadFile = File(...),
     consent: bool = Form(False),
+    name: str = Form(""),
 ):
     """Save an uploaded reference sample and return a voice_id to reuse later."""
     enforce(_clone_rl, client_ip(request))
@@ -291,12 +367,86 @@ async def clone(
 
     voice_id = uuid.uuid4().hex
     torchaudio.save(str(_voice_path(voice_id)), wav, sr)
-    return {"voice_id": voice_id, "duration_sec": round(duration, 2), "warnings": warnings}
+
+    display_name = _clean_name(name)
+    _set_meta_entry(voice_id, {
+        "name": display_name,
+        "created_at": time.time(),
+        "duration_sec": round(duration, 2),
+    })
+    return {
+        "voice_id": voice_id,
+        "name": display_name,
+        "duration_sec": round(duration, 2),
+        "warnings": warnings,
+    }
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def _postprocess(wav: "torch.Tensor", sr: int, pitch: float, speed: float) -> "np.ndarray":
+    """Downmix to mono float32 and apply pitch-shift / time-stretch (CPU).
+
+    pitch is in semitones (+ = higher); speed is a tempo multiplier that
+    preserves pitch. Both are skipped when at their no-op defaults, so the
+    default request path pays no extra cost.
+    """
+    audio = wav.detach().cpu().float().numpy()
+    if audio.ndim > 1:
+        audio = audio.mean(axis=0)  # downmix to mono
+    audio = np.ascontiguousarray(audio, dtype=np.float32)
+
+    if abs(pitch) > 1e-6 or abs(speed - 1.0) > 1e-6:
+        import librosa  # heavy import — only loaded when actually needed
+        if abs(pitch) > 1e-6:
+            audio = librosa.effects.pitch_shift(audio, sr=sr, n_steps=float(pitch))
+        if abs(speed - 1.0) > 1e-6:
+            audio = librosa.effects.time_stretch(audio, rate=float(speed))
+    return np.ascontiguousarray(audio, dtype=np.float32)
+
+
+def _encode(audio: "np.ndarray", sr: int, fmt: str) -> tuple[io.BytesIO, str, str]:
+    """Encode a mono float32 signal to wav or mp3. Returns (buffer, media_type, ext)."""
+    pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
+    if fmt == "mp3":
+        from pydub import AudioSegment  # needs ffmpeg on PATH
+        seg = AudioSegment(pcm16.tobytes(), frame_rate=int(sr), sample_width=2, channels=1)
+        buf = io.BytesIO()
+        seg.export(buf, format="mp3", bitrate="192k")
+        buf.seek(0)
+        return buf, "audio/mpeg", "mp3"
+
+    # WAV: write 16-bit PCM via torchaudio (consistent with the rest of the app).
+    buf = io.BytesIO()
+    torchaudio.save(buf, torch.from_numpy(pcm16).unsqueeze(0), int(sr), format="wav")
+    buf.seek(0)
+    return buf, "audio/wav", "wav"
 
 
 @app.post("/api/generate", dependencies=[Depends(require_api_key)])
-def generate(request: Request, voice_id: str = Form(...), text: str = Form(...)):
-    """Generate speech in the cloned voice."""
+def generate(
+    request: Request,
+    voice_id: str = Form(...),
+    text: str = Form(...),
+    exaggeration: float = Form(0.5),
+    cfg_weight: float = Form(0.5),
+    temperature: float = Form(0.8),
+    speed: float = Form(1.0),
+    pitch: float = Form(0.0),
+    format: str = Form("wav"),
+):
+    """Generate speech in the cloned voice.
+
+    Controls (all optional, clamped server-side):
+      exaggeration  expressiveness / emotional intensity (Chatterbox)
+      cfg_weight    pacing & adherence to the reference (Chatterbox)
+      temperature   sampling variation (Chatterbox)
+      speed         playback tempo, pitch-preserving (post-process)
+      pitch         tone shift in semitones, -6..+6 (post-process)
+      format        "wav" (default) or "mp3"
+    """
     if MODEL is None:
         raise HTTPException(503, "model still loading, try again shortly")
 
@@ -314,14 +464,38 @@ def generate(request: Request, voice_id: str = Form(...), text: str = Form(...))
     if not ref.exists():
         raise HTTPException(404, "unknown voice_id (clone a voice first)")
 
+    exaggeration = _clamp(exaggeration, 0.25, 2.0)
+    cfg_weight = _clamp(cfg_weight, 0.0, 1.0)
+    temperature = _clamp(temperature, 0.1, 1.5)
+    speed = _clamp(speed, 0.5, 2.0)
+    pitch = _clamp(pitch, -6.0, 6.0)
+    fmt = "mp3" if str(format).lower() == "mp3" else "wav"
+
     # Serialize GPU access so concurrent requests don't exhaust VRAM.
     with GPU_LOCK:
-        wav = MODEL.generate(text, audio_prompt_path=str(ref))
+        wav = MODEL.generate(
+            text,
+            audio_prompt_path=str(ref),
+            exaggeration=exaggeration,
+            cfg_weight=cfg_weight,
+            temperature=temperature,
+        )
 
-    buf = io.BytesIO()
-    torchaudio.save(buf, wav, MODEL.sr, format="wav")
-    buf.seek(0)
-    return StreamingResponse(buf, media_type="audio/wav")
+    # Fast path: default WAV with no pitch/speed change → original behavior.
+    if fmt == "wav" and abs(pitch) < 1e-6 and abs(speed - 1.0) < 1e-6:
+        buf = io.BytesIO()
+        torchaudio.save(buf, wav, MODEL.sr, format="wav")
+        buf.seek(0)
+        return StreamingResponse(buf, media_type="audio/wav")
+
+    # CPU post-processing happens OUTSIDE the GPU lock.
+    audio = _postprocess(wav, MODEL.sr, pitch, speed)
+    buf, media_type, ext = _encode(audio, MODEL.sr, fmt)
+    return StreamingResponse(
+        buf,
+        media_type=media_type,
+        headers={"Content-Disposition": f'inline; filename="voice-clone.{ext}"'},
+    )
 
 
 if __name__ == "__main__":

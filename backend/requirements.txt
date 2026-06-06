@@ -3,3 +3,9 @@ chatterbox-tts
 fastapi
 uvicorn[standard]
 python-multipart
+# Audio post-processing (speed / pitch) and MP3 output.
+# NOTE: MP3 export also needs the system `ffmpeg` binary on PATH.
+librosa
+soundfile
+pydub
+numpy
